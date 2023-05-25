@@ -1,9 +1,71 @@
 import logging
 from multiprocessing import Process, Queue
 
-from sqlalchemy import create_engine, MetaData, Table, select, insert, and_
+from sqlalchemy import create_engine, MetaData, Table, DDL, Column, select, insert, and_, func, text
+from sqlalchemy.engine.base import Connection
 
 log = logging.getLogger("db-copy")
+
+BATCH_SIZE = 10000
+
+
+def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
+    columns = []
+    for column in table.columns:
+        new_column = Column(column.name, column.type, primary_key=column.primary_key, autoincrement=column.autoincrement)
+        columns.append(new_column)
+
+    copy_table = Table(copy_table_name, metadata, *columns)
+    return copy_table
+
+
+def swap_tables(conn: Connection, table: Table, copy_table: Table):
+    conn.execute(text(f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name}", bind=conn))
+
+
+def first(xs):
+    for x in xs:
+        return x
+
+
+def scalar(xs):
+    result = first(xs)
+    return result[0] if result else result
+
+
+class TablePageIterator:
+
+    def __init__(self, conn: Connection, table: Table, batch_size=BATCH_SIZE) -> None:
+        self.conn = conn
+        self.table = table
+        self.batch_size = batch_size
+
+        self.last_page = None
+
+        stmt = select(func.count("*")).select_from(self.table)
+        self.count = scalar(self.conn.execute(stmt))
+        log.info("table %s has %d total rows", self.table.name, self.count)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        pk_cols = self.table.primary_key.columns
+
+        stmt = select(pk_cols)
+        if self.last_page:
+            clauses = [col > val for col, val in zip(pk_cols, self.last_page)]
+            stmt = stmt.where(and_(*clauses))
+
+        stmt = stmt.limit(1).offset(self.batch_size)
+
+        next_page = first(self.conn.execute(stmt))
+        if next_page is None:
+            raise StopIteration()
+
+        rv = (self.last_page, next_page)
+        self.last_page = next_page
+        return rv
 
 
 class CopyWorker(Process):
