@@ -1,6 +1,7 @@
 #!/bin/which python
 
 import argparse
+
 import getpass
 import logging
 from multiprocessing import Queue
@@ -11,15 +12,12 @@ from sqlalchemy import create_engine, MetaData, Table
 
 import tqdm
 
-from .db import CopyWorker, TablePageIterator, clone_table, swap_tables
+from .db import DBConfig, CopyWorker, TablePageIterator, clone_table, swap_tables
 
 WORKERS = 3
 
 log = logging.getLogger("alter-schema")
 
-
-def uri_from_args(args):
-    return f"mysql+pymysql://{args.user}:{args.password}@{args.host}/{args.database}"
 
 
 def parse_args():
@@ -53,10 +51,11 @@ def main():
     logging.basicConfig(level=logging.DEBUG)
 
     args = parse_args()
-    uri = uri_from_args(args)
-    log.info("connecting to %s", uri)
 
-    engine = create_engine(uri)
+    config = DBConfig.from_args(args)
+    log.info("connecting to %s", config.uri)
+
+    engine = create_engine(config.uri)
     metadata = MetaData()
 
     request_queue = Queue()
@@ -65,7 +64,7 @@ def main():
     copy_table_name = args.table + "_new"
     old_table_name = args.table + "_old"
 
-    workers = [CopyWorker(uri, args.table, copy_table_name, request_queue, completion_queue) for _ in range(WORKERS)]
+    workers = [CopyWorker(config, args.table, copy_table_name, request_queue, completion_queue) for _ in range(WORKERS)]
     for worker in workers:
         worker.start()
 
@@ -113,9 +112,7 @@ def main():
         if confirm("Swap table? [Y/n] "):
             old_table = Table(old_table_name, metadata)
             old_table.drop(engine, checkfirst=True)
-
             swap_tables(conn, table, copy_table)
-
             old_table.drop(engine, checkfirst=True)
 
     return 0

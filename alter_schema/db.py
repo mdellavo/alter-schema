@@ -1,3 +1,5 @@
+import abc
+import dataclasses
 import logging
 from multiprocessing import Process, Queue
 
@@ -7,7 +9,6 @@ from sqlalchemy.engine.base import Connection
 log = logging.getLogger("db-copy")
 
 BATCH_SIZE = 10000
-
 
 def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     columns = []
@@ -31,6 +32,31 @@ def first(xs):
 def scalar(xs):
     result = first(xs)
     return result[0] if result else result
+
+
+@dataclasses.dataclass
+class DBConfig:
+    user: str
+    password: str
+    host: str
+    database: str
+    port: str
+    table: str
+
+    @property
+    def uri(self):
+        return f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            args.user,
+            args.password,
+            args.host,
+            args.database,
+            args.port,
+            args.table,
+        )
 
 
 class TablePageIterator:
@@ -69,9 +95,9 @@ class TablePageIterator:
 
 
 class CopyWorker(Process):
-    def __init__(self, uri: str, table_name: str, copy_table_name: str, request_queue: Queue, completion_queue: Queue):
+    def __init__(self, config: DBConfig, table_name: str, copy_table_name: str, request_queue: Queue, completion_queue: Queue):
         super(CopyWorker, self).__init__()
-        self.uri = uri
+        self.config = config
         self.table_name = table_name
         self.copy_table_name = copy_table_name
         self.request_queue = request_queue
@@ -80,7 +106,7 @@ class CopyWorker(Process):
     def run(self) -> None:
         logging.basicConfig(level=logging.DEBUG)
 
-        engine = create_engine(self.uri)
+        engine = create_engine(self.config.uri)
         metadata = MetaData()
 
         running = True
@@ -104,3 +130,30 @@ class CopyWorker(Process):
 
                 # log.info("copying page %s", page)
                 self.completion_queue.put(page)
+
+
+class Monitor(metaclass=abc.ABCMeta):
+
+    @abc.abstractmethod
+    def attach(self):
+        pass
+
+    @abc.abstractmethod
+    def detach(self):
+        pass
+
+
+class TriggerMonitor(Monitor):
+    def attach(self):
+        pass
+
+    def detach(self):
+        pass
+
+
+class ReplicationMonitor(Monitor):
+    def attach(self):
+        pass
+
+    def detach(self):
+        pass
