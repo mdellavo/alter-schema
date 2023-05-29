@@ -12,12 +12,19 @@ from sqlalchemy import create_engine, MetaData, Table
 
 import tqdm
 
-from .db import DBConfig, CopyWorker, TablePageIterator, clone_table, swap_tables
+from .db import (
+    DBConfig,
+    CopyWorker,
+    TablePageIterator,
+    TriggerMonitor,
+    ReplicationMonitor,
+    clone_table,
+    swap_tables,
+)
 
 WORKERS = 3
 
 log = logging.getLogger("alter-schema")
-
 
 
 def parse_args():
@@ -72,6 +79,9 @@ def main():
         table = Table(args.table, metadata, autoload_with=conn)
         log.info("primary key %s", table.primary_key)
 
+        monitor = TriggerMonitor(config, conn, table)
+        monitor.attach()
+
         copy_table = clone_table(metadata, table, copy_table_name)
         copy_table.drop(conn, checkfirst=True)
         copy_table.create(conn, checkfirst=True)
@@ -96,10 +106,12 @@ def main():
         completion_thread.start()
 
         for i, page in enumerate(table_iterator):
+            print("page", i, page, page[1][0] - page[0][0] if page[0] is not None and page[1] is not None else "")
             request_queue.put(page)
 
         for _ in workers:
             request_queue.put(None)
+
         for worker in workers:
             worker.join()
 

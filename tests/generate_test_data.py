@@ -18,7 +18,7 @@ def build_row():
     }
 
 
-values = [build_row() for _ in range(100_000)]
+values = [build_row() for _ in range(1_000_000)]
 
 
 with engine.connect() as conn:
