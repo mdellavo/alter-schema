@@ -67,11 +67,7 @@ def main():
 
     request_queue = Queue()
     completion_queue = Queue()
-
-    copy_table_name = args.table + "_new"
-    old_table_name = args.table + "_old"
-
-    workers = [CopyWorker(config, args.table, copy_table_name, request_queue, completion_queue) for _ in range(WORKERS)]
+    workers = [CopyWorker(config, request_queue, completion_queue) for _ in range(WORKERS)]
     for worker in workers:
         worker.start()
 
@@ -79,14 +75,14 @@ def main():
         table = Table(args.table, metadata, autoload_with=conn)
         log.info("primary key %s", table.primary_key)
 
-        monitor = TriggerMonitor(config, conn, table)
+        monitor = ReplicationMonitor(config)
         monitor.attach()
 
-        copy_table = clone_table(metadata, table, copy_table_name)
+        copy_table = clone_table(metadata, table, config.copy_table)
         copy_table.drop(conn, checkfirst=True)
         copy_table.create(conn, checkfirst=True)
 
-        log.info("Created copy table %s", copy_table_name)
+        log.info("Created copy table %s", config.copy_table)
 
         table_iterator = TablePageIterator(conn, table)
 
@@ -106,7 +102,7 @@ def main():
         completion_thread.start()
 
         for i, page in enumerate(table_iterator):
-            print("page", i, page, page[1][0] - page[0][0] if page[0] is not None and page[1] is not None else "")
+            #print("page", i, page, page[1][0] - page[0][0] if page[0] is not None and page[1] is not None else "")
             request_queue.put(page)
 
         for _ in workers:
@@ -122,7 +118,7 @@ def main():
 
         # Swap table
         if confirm("Swap table? [Y/n] "):
-            old_table = Table(old_table_name, metadata)
+            old_table = Table(config.old_table, metadata)
             old_table.drop(engine, checkfirst=True)
             swap_tables(conn, table, copy_table)
             old_table.drop(engine, checkfirst=True)

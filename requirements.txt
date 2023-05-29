@@ -1,4 +1,4 @@
 sqlalchemy
 pymysql
-mysql-replication-watcher
+mysql-replication
 tqdm

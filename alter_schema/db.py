@@ -2,15 +2,30 @@ import abc
 import dataclasses
 import logging
 from multiprocessing import Process, Queue
+import random
+import time
 
 from sqlalchemy import create_engine, MetaData, Table, Column, select, and_, func, text
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.dialects.mysql import insert
 
+from pymysqlreplication import BinLogStreamReader
+from pymysqlreplication.row_event import (
+    WriteRowsEvent,
+    UpdateRowsEvent,
+    DeleteRowsEvent,
+)
+
 
 log = logging.getLogger("db-copy")
 
 BATCH_SIZE = 10000
+
+def make_copy_table_name(table: str):
+    return table + "_new"
+
+def make_old_table_name(table: str):
+    return table + "old"
 
 def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     columns = []
@@ -48,6 +63,18 @@ class DBConfig:
     @property
     def uri(self):
         return f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
+
+    @property
+    def as_dict(self):
+        return dataclasses.asdict(self)
+
+    @property
+    def copy_table(self):
+        return make_copy_table_name(self.table)
+
+    @property
+    def old_table(self):
+        return make_old_table_name(self.table)
 
     @classmethod
     def from_args(cls, args):
@@ -89,8 +116,6 @@ class TablePageIterator:
             stmt = stmt.where(and_(*clauses))
 
         stmt = stmt.limit(1).offset(self.batch_size).order_by(*[col.asc() for col in pk_cols.values()])
-        print(stmt)
-
         next_page = first(self.conn.execute(stmt))
         if next_page is None:
             self.exhaused = True
@@ -101,24 +126,20 @@ class TablePageIterator:
 
 
 class CopyWorker(Process):
-    def __init__(self, config: DBConfig, table_name: str, copy_table_name: str, request_queue: Queue, completion_queue: Queue):
+    def __init__(self, config: DBConfig, request_queue: Queue, completion_queue: Queue):
         super(CopyWorker, self).__init__()
         self.config = config
-        self.table_name = table_name
-        self.copy_table_name = copy_table_name
         self.request_queue = request_queue
         self.completion_queue = completion_queue
 
     def run(self) -> None:
-        logging.basicConfig(level=logging.DEBUG)
-
         engine = create_engine(self.config.uri)
         metadata = MetaData()
 
         running = True
         with engine.connect() as conn:
-            table = Table(self.table_name, metadata, autoload_with=engine)
-            copy_table = Table(self.copy_table_name, metadata, autoload_with=engine)
+            table = Table(self.config.table, metadata, autoload_with=engine)
+            copy_table = Table(self.config.copy_table, metadata, autoload_with=engine)
 
             while running:
                 page = self.request_queue.get()
@@ -144,11 +165,6 @@ class CopyWorker(Process):
 
 
 class Monitor(metaclass=abc.ABCMeta):
-
-    def __init__(self, config: DBConfig, conn: Connection, table: Table):
-        self.config = config
-        self.conn = conn
-        self.table = table
 
     @abc.abstractmethod
     def attach(self):
@@ -189,6 +205,11 @@ class TriggerMonitor(Monitor):
         "schema_alter_monitor_delete",
     ]
 
+    def __init__(self, config: DBConfig, conn: Connection, table: Table):
+        self.config = config
+        self.conn = conn
+        self.table = table
+
     def _build(self, template: str):
         cols = [col.name for col in self.table.c.values()]
         new_values = ["NEW." + col.name for col in self.table.c.values()]
@@ -214,9 +235,56 @@ class TriggerMonitor(Monitor):
             self.conn.execute(text("DROP TRIGGER " + trigger_name))
 
 
+class ReplicationWorker(Process):
+    def __init__(self, config: DBConfig):
+        super(ReplicationWorker, self).__init__()
+        self.config = config
+
+    def run(self):
+
+        engine = create_engine(self.config.uri)
+        metadata = MetaData()
+
+        running = True
+        with engine.connect() as conn:
+            table = Table(self.config.table, metadata, autoload_with=engine)
+            copy_table = Table(self.config.copy_table, metadata, autoload_with=engine)
+
+            server_id = random.randint(0, 1_000_000)
+            stream = BinLogStreamReader(
+                connection_settings={
+                    "host": self.config.host,
+                    "port": int(self.config.port),
+                    "user": self.config.user,
+                    "passwd": self.config.password,
+                },
+                server_id=server_id,
+                blocking=True,
+                only_events=[
+                    UpdateRowsEvent,
+                    WriteRowsEvent,
+                    DeleteRowsEvent,
+                ],
+                only_tables=[
+                    self.config.table,
+                ],
+                skip_to_timestamp=time.time(),
+            )
+
+            for event in stream:
+                pass
+
+            stream.close()
+
+
 class ReplicationMonitor(Monitor):
+
+    def __init__(self, config: DBConfig):
+        self.worker = ReplicationWorker(config)
+
     def attach(self):
-        pass
+        self.worker.start()
 
     def detach(self):
-        pass
+        self.worker.terminate()
+        self.worker.close()
