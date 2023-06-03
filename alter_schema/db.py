@@ -1,15 +1,19 @@
 import abc
 import dataclasses
 import logging
-from multiprocessing import Process, Queue
+import math
+import multiprocessing
+import threading
 import random
 import time
+import queue
 
 from sqlalchemy import create_engine, MetaData, Table, Column, select, and_, func, text
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.dialects.mysql import insert
 
 from pymysqlreplication import BinLogStreamReader
+from pymysqlreplication.event import QueryEvent
 from pymysqlreplication.row_event import (
     WriteRowsEvent,
     UpdateRowsEvent,
@@ -25,7 +29,7 @@ def make_copy_table_name(table: str):
     return table + "_new"
 
 def make_old_table_name(table: str):
-    return table + "old"
+    return table + "_old"
 
 def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     columns = []
@@ -37,8 +41,11 @@ def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     return copy_table
 
 
-def swap_tables(conn: Connection, table: Table, copy_table: Table):
-    conn.execute(text(f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name}", bind=conn))
+def swap_tables(conn: Connection, table: Table, copy_table: Table, comment=None):
+    sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name}"
+    if comment:
+        sql += " -- " + comment
+    conn.execute(text(sql, bind=conn))
 
 
 def first(xs):
@@ -99,7 +106,8 @@ class TablePageIterator:
 
         stmt = select(func.count("*")).select_from(self.table)
         self.count = scalar(self.conn.execute(stmt))
-        log.info("table %s has %d total rows, %s pages", self.table.name, self.count, self.count / self.batch_size)
+        self.pages = int(math.ceil(self.count / self.batch_size))
+        log.info("table %s has %d total rows, %s pages", self.table.name, self.count, self.pages)
 
     def __iter__(self):
         return self
@@ -110,23 +118,37 @@ class TablePageIterator:
 
         pk_cols = self.table.primary_key.columns
 
-        stmt = select(pk_cols)
+        base_query = (
+            select(pk_cols)
+            .order_by(*[col.asc() for col in pk_cols.values()])
+            .limit(self.batch_size)
+        )
         if self.last_page:
             clauses = [col >= val for col, val in zip(pk_cols, self.last_page)]
-            stmt = stmt.where(and_(*clauses))
+            base_query = base_query.where(and_(*clauses))
 
-        stmt = stmt.limit(1).offset(self.batch_size).order_by(*[col.asc() for col in pk_cols.values()])
-        next_page = first(self.conn.execute(stmt))
-        if next_page is None:
+        base_query = base_query.subquery()
+
+        cols = [func.count("*").label("count"),]
+        cols.extend([func.min(col).label("min_"+ col.name) for col in base_query.c])
+        cols.extend([func.max(col).label("max_"+ col.name) for col in base_query.c])
+
+        query = select(cols)
+        result = first(self.conn.execute(query))
+
+        lower = [getattr(result, "min_" + col.name) for col in base_query.c]
+        upper = [getattr(result, "max_" + col.name) for col in base_query.c]
+
+        if result.count < self.batch_size:
             self.exhaused = True
 
-        rv = (self.last_page, next_page)
-        self.last_page = next_page
-        return rv
+        self.last_page = upper
+
+        return (lower, upper)
 
 
-class CopyWorker(Process):
-    def __init__(self, config: DBConfig, request_queue: Queue, completion_queue: Queue):
+class CopyWorker(multiprocessing.Process):
+    def __init__(self, config: DBConfig, request_queue: multiprocessing.Queue, completion_queue: multiprocessing.Queue):
         super(CopyWorker, self).__init__()
         self.config = config
         self.request_queue = request_queue
@@ -149,7 +171,7 @@ class CopyWorker(Process):
 
                 lower, upper = page
                 lower_clause = and_(*[col >= val for col, val in zip(table.primary_key.columns, lower)]) if lower else None
-                upper_clause = and_(*[col < val for col, val in zip(table.primary_key.columns, upper)]) if upper else None
+                upper_clause = and_(*[col <= val for col, val in zip(table.primary_key.columns, upper)]) if upper else None
 
                 page_select = select(table).where(lower_clause, upper_clause)
                 page_insert = insert(copy_table).from_select(copy_table.columns, page_select)
@@ -235,17 +257,30 @@ class TriggerMonitor(Monitor):
             self.conn.execute(text("DROP TRIGGER " + trigger_name))
 
 
-class ReplicationWorker(Process):
-    def __init__(self, config: DBConfig):
+def replication_reader(event, stream: BinLogStreamReader, q: queue.Queue):
+    while not event.is_set():
+        try:
+            ev = stream.fetchone()
+            q.put(ev)
+        except Exception:
+            logging.exception("error during replication reader")
+            break
+
+
+class ReplicationWorker(multiprocessing.Process):
+
+    READ_TIMEOUT = 1
+
+    def __init__(self, config: DBConfig, event):
         super(ReplicationWorker, self).__init__()
         self.config = config
+        self.event = event
 
     def run(self):
 
         engine = create_engine(self.config.uri)
         metadata = MetaData()
 
-        running = True
         with engine.connect() as conn:
             table = Table(self.config.table, metadata, autoload_with=engine)
             copy_table = Table(self.config.copy_table, metadata, autoload_with=engine)
@@ -260,31 +295,60 @@ class ReplicationWorker(Process):
                 },
                 server_id=server_id,
                 blocking=True,
+                only_tables=[
+                    self.config.table,
+                ],
                 only_events=[
+                    QueryEvent,
                     UpdateRowsEvent,
                     WriteRowsEvent,
                     DeleteRowsEvent,
                 ],
-                only_tables=[
-                    self.config.table,
-                ],
                 skip_to_timestamp=time.time(),
             )
 
-            for event in stream:
-                pass
+            reader_queue = queue.Queue()
+            reader_thread = threading.Thread(target=replication_reader, args=(self.event, stream, reader_queue), daemon=True)
+            reader_thread.start()
+
+            # FIXME this seems like it could drop events, make sure to drain
+            while not self.event.is_set():
+                try:
+                    event = reader_queue.get(timeout=self.READ_TIMEOUT)
+                except queue.Empty:
+                    continue
+
+                if type(event) == WriteRowsEvent:
+                    self.handle_write_event(event)
+                elif type(event) == UpdateRowsEvent:
+                    self.handle_update_event(event)
+                elif type(event) == DeleteRowsEvent:
+                    self.handle_delete_event(event)
 
             stream.close()
+
+            # FIXME this blocks :(
+            #reader_thread.join()
+
+    def handle_write_event(self, event: WriteRowsEvent):
+        event.dump()
+
+    def handle_update_event(self, event: UpdateRowsEvent):
+        event.dump()
+
+    def handle_delete_event(self, event: DeleteRowsEvent):
+        event.dump()
 
 
 class ReplicationMonitor(Monitor):
 
     def __init__(self, config: DBConfig):
-        self.worker = ReplicationWorker(config)
+        self.event = multiprocessing.Event()
+        self.worker = ReplicationWorker(config, self.event)
 
     def attach(self):
         self.worker.start()
 
     def detach(self):
-        self.worker.terminate()
-        self.worker.close()
+        self.event.set()
+        self.worker.join()

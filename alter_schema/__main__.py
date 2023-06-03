@@ -7,8 +7,9 @@ import logging
 from multiprocessing import Queue
 import sys
 import threading
+import uuid
 
-from sqlalchemy import create_engine, MetaData, Table
+from sqlalchemy import create_engine, MetaData, Table, text
 
 import tqdm
 
@@ -122,6 +123,8 @@ def main():
             old_table.drop(engine, checkfirst=True)
             swap_tables(conn, table, copy_table)
             old_table.drop(engine, checkfirst=True)
+
+        monitor.detach()
 
     return 0
 
