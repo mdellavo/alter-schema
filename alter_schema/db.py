@@ -8,7 +8,7 @@ import random
 import time
 import queue
 
-from sqlalchemy import create_engine, MetaData, Table, Column, select, and_, func, text
+from sqlalchemy import create_engine, MetaData, Table, Column, select, and_, func, text, delete, tuple_
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.dialects.mysql import insert
 
@@ -252,9 +252,12 @@ class TriggerMonitor(Monitor):
         for trigger in [insert_trigger, update_trigger, delete_trigger]:
             self.conn.execute(text(trigger))
 
+        log.info("triggers attached")
+
     def detach(self):
         for trigger_name in self.TRIGGER_NAMES:
             self.conn.execute(text("DROP TRIGGER " + trigger_name))
+        log.info("triggers detached")
 
 
 def replication_reader(event, stream: BinLogStreamReader, q: queue.Queue):
@@ -263,7 +266,7 @@ def replication_reader(event, stream: BinLogStreamReader, q: queue.Queue):
             ev = stream.fetchone()
             q.put(ev)
         except Exception:
-            logging.exception("error during replication reader")
+            log.exception("error during replication reader")
             break
 
 
@@ -319,25 +322,33 @@ class ReplicationWorker(multiprocessing.Process):
                     continue
 
                 if type(event) == WriteRowsEvent:
-                    self.handle_write_event(event)
+                    self.handle_write_event(conn, copy_table, event)
                 elif type(event) == UpdateRowsEvent:
-                    self.handle_update_event(event)
+                    self.handle_update_event(conn, copy_table, event)
                 elif type(event) == DeleteRowsEvent:
-                    self.handle_delete_event(event)
+                    self.handle_delete_event(conn, copy_table, event)
 
             stream.close()
-
             # FIXME this blocks :(
             #reader_thread.join()
+            log.info("replication stream closed")
 
-    def handle_write_event(self, event: WriteRowsEvent):
+    def handle_write_event(self, conn: Connection, table: Table, event: WriteRowsEvent):
+        values = [row["values"] for row in event.rows]
+        query = insert(table).values(values)
+        conn.execute(query)
+
+    def handle_update_event(self, conn: Connection, table: Table, event: UpdateRowsEvent):
         event.dump()
 
-    def handle_update_event(self, event: UpdateRowsEvent):
-        event.dump()
+    def handle_delete_event(self, conn: Connection, table: Table, event: DeleteRowsEvent):
 
-    def handle_delete_event(self, event: DeleteRowsEvent):
-        event.dump()
+        def make_value(row):
+            return {column.name: row["values"][column.name] for column in table.primary_key.columns}
+
+        values = [make_value(row) for row in event.rows]
+        query = delete(table).where(tuple_(*table.primary_key.columns).in_(values))
+        conn.execute(query)
 
 
 class ReplicationMonitor(Monitor):
@@ -348,7 +359,9 @@ class ReplicationMonitor(Monitor):
 
     def attach(self):
         self.worker.start()
+        log.info("replication attached")
 
     def detach(self):
         self.event.set()
         self.worker.join()
+        log.info("replication detached")
