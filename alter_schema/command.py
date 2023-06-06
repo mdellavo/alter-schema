@@ -23,7 +23,7 @@ from .db import (
 WORKERS = 3
 
 log = logging.getLogger("alter-schema")
-c
+
 
 def confirm(prompt):
     line = None
