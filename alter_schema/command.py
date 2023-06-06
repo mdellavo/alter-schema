@@ -1,11 +1,8 @@
-#!/bin/which python
-
 import argparse
 
 import getpass
 import logging
 from multiprocessing import Queue
-import sys
 import threading
 
 from sqlalchemy import create_engine, MetaData, Table
@@ -26,7 +23,7 @@ from .db import (
 WORKERS = 3
 
 log = logging.getLogger("alter-schema")
-
+c
 
 def confirm(prompt):
     line = None
@@ -96,7 +93,7 @@ class Command:
                         break
 
                     pbar.update(table_iterator.batch_size)
-                    log.info("page complete: %s", page)
+                    log.debug("page complete: %s", page)
 
             completion_thread = threading.Thread(target=on_completion, daemon=True)
             completion_thread.start()
@@ -120,7 +117,10 @@ class Command:
                 old_table = Table(config.old_table, metadata)
                 old_table.drop(engine, checkfirst=True)
                 swap_tables(conn, table, copy_table)
+                log.info("swapped %s to %s, %s to %s",
+                         config.table, config.old_table, config.copy_table, config.table)
                 old_table.drop(engine, checkfirst=True)
+                log.info("dropped old table %s", config.old_table)
 
             monitor.detach()
 
@@ -137,9 +137,3 @@ class Command:
                 rv = 1
 
         return rv
-
-
-if __name__ == "__main__":
-    command = Command()
-    rv = command.run(sys.argv[1:])
-    sys.exit(rv)
