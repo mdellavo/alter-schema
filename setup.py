@@ -5,8 +5,10 @@ def slurp(path):
     with open(path) as f:
         return [line.strip() for line in f]
 
+
 def requirements():
     return slurp("requirements.txt")
+
 
 def requirements_dev():
     return slurp("requirements-dev.txt")

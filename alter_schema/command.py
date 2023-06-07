@@ -6,6 +6,7 @@ from multiprocessing import Queue
 import threading
 
 from sqlalchemy import create_engine, MetaData, Table
+from sqlalchemy.exc import NoSuchTableError
 
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -68,7 +69,13 @@ class Command:
             worker.start()
 
         with engine.connect() as conn:
-            table = Table(args.table, metadata, autoload_with=conn)
+
+            try:
+                table = Table(args.table, metadata, autoload_with=conn)
+            except NoSuchTableError:
+                log.error("Table %s does not exist", args.table)
+                return 1
+
             log.info("primary key %s", table.primary_key)
 
             monitor = ReplicationMonitor(config)
