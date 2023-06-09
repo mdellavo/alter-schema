@@ -8,7 +8,18 @@ import random
 import time
 import queue
 
-from sqlalchemy import create_engine, MetaData, Table, Column, select, and_, func, text, delete, tuple_
+from sqlalchemy import (
+    create_engine,
+    MetaData,
+    Table,
+    Column,
+    select,
+    and_,
+    func,
+    text,
+    delete,
+    tuple_,
+)
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.dialects.mysql import insert
 
@@ -25,16 +36,24 @@ log = logging.getLogger("db-copy")
 
 BATCH_SIZE = 10000
 
+
 def make_copy_table_name(table: str):
     return table + "_new"
+
 
 def make_old_table_name(table: str):
     return table + "_old"
 
+
 def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     columns = []
     for column in table.columns:
-        new_column = Column(column.name, column.type, primary_key=column.primary_key, autoincrement=column.autoincrement)
+        new_column = Column(
+            column.name,
+            column.type,
+            primary_key=column.primary_key,
+            autoincrement=column.autoincrement,
+        )
         columns.append(new_column)
 
     copy_table = Table(copy_table_name, metadata, *columns)
@@ -45,7 +64,7 @@ def swap_tables(conn: Connection, table: Table, copy_table: Table, comment=None)
     sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name}"
     if comment:
         sql += " -- " + comment
-    conn.execute(text(sql, bind=conn))
+    conn.execute(text(sql))
 
 
 def first(xs):
@@ -69,7 +88,9 @@ class DBConfig:
 
     @property
     def uri(self):
-        return f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
+        return (
+            f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
+        )
 
     @property
     def as_dict(self):
@@ -96,7 +117,6 @@ class DBConfig:
 
 
 class TablePageIterator:
-
     def __init__(self, conn: Connection, table: Table, batch_size=BATCH_SIZE) -> None:
         self.conn = conn
         self.table = table
@@ -107,7 +127,12 @@ class TablePageIterator:
         stmt = select(func.count("*")).select_from(self.table)
         self.count = scalar(self.conn.execute(stmt))
         self.pages = int(math.ceil(self.count / self.batch_size))
-        log.info("table %s has %d total rows, %s pages", self.table.name, self.count, self.pages)
+        log.info(
+            "table %s has %d total rows, %s pages",
+            self.table.name,
+            self.count,
+            self.pages,
+        )
 
     def __iter__(self):
         return self
@@ -129,11 +154,13 @@ class TablePageIterator:
 
         base_query = base_query.subquery()
 
-        cols = [func.count("*").label("count"),]
-        cols.extend([func.min(col).label("min_"+ col.name) for col in base_query.c])
-        cols.extend([func.max(col).label("max_"+ col.name) for col in base_query.c])
+        cols = [
+            func.count("*").label("count"),
+        ]
+        cols.extend([func.min(col).label("min_" + col.name) for col in base_query.c])
+        cols.extend([func.max(col).label("max_" + col.name) for col in base_query.c])
 
-        query = select(cols)
+        query = select(*cols)
         result = first(self.conn.execute(query))
 
         lower = [getattr(result, "min_" + col.name) for col in base_query.c]
@@ -148,7 +175,12 @@ class TablePageIterator:
 
 
 class CopyWorker(multiprocessing.Process):
-    def __init__(self, config: DBConfig, request_queue: multiprocessing.Queue, completion_queue: multiprocessing.Queue):
+    def __init__(
+        self,
+        config: DBConfig,
+        request_queue: multiprocessing.Queue,
+        completion_queue: multiprocessing.Queue,
+    ):
         super(CopyWorker, self).__init__()
         self.config = config
         self.request_queue = request_queue
@@ -170,16 +202,34 @@ class CopyWorker(multiprocessing.Process):
                     break
 
                 lower, upper = page
-                lower_clause = and_(*[col >= val for col, val in zip(table.primary_key.columns, lower)]) if lower else None
-                upper_clause = and_(*[col <= val for col, val in zip(table.primary_key.columns, upper)]) if upper else None
+                lower_clause = (
+                    and_(
+                        *[
+                            col >= val
+                            for col, val in zip(table.primary_key.columns, lower)
+                        ]
+                    )
+                    if lower
+                    else None
+                )
+                upper_clause = (
+                    and_(
+                        *[
+                            col <= val
+                            for col, val in zip(table.primary_key.columns, upper)
+                        ]
+                    )
+                    if upper
+                    else None
+                )
 
                 page_select = select(table).where(lower_clause, upper_clause)
-                page_insert = insert(copy_table).from_select(copy_table.columns, page_select)
+                page_insert = insert(copy_table).from_select(
+                    copy_table.columns, page_select
+                )
 
                 values = {col.key: table.c[col.key] for col in table.c}
-                on_duplicate_key_update = page_insert.on_duplicate_key_update(
-                    **values
-                )
+                on_duplicate_key_update = page_insert.on_duplicate_key_update(**values)
                 conn.execute(on_duplicate_key_update)
 
                 # log.info("copying page %s", page)
@@ -187,7 +237,6 @@ class CopyWorker(multiprocessing.Process):
 
 
 class Monitor(metaclass=abc.ABCMeta):
-
     @abc.abstractmethod
     def attach(self):
         pass
@@ -235,7 +284,10 @@ class TriggerMonitor(Monitor):
     def _build(self, template: str):
         cols = [col.name for col in self.table.c.values()]
         new_values = ["NEW." + col.name for col in self.table.c.values()]
-        pk_where = [col.name + " = OLD." + col.name for col in self.table.primary_key.columns.values()]
+        pk_where = [
+            col.name + " = OLD." + col.name
+            for col in self.table.primary_key.columns.values()
+        ]
 
         return template.format(
             table_name=self.table.name,
@@ -311,7 +363,11 @@ class ReplicationWorker(multiprocessing.Process):
             )
 
             reader_queue = queue.Queue()
-            reader_thread = threading.Thread(target=replication_reader, args=(self.event, stream, reader_queue), daemon=True)
+            reader_thread = threading.Thread(
+                target=replication_reader,
+                args=(self.event, stream, reader_queue),
+                daemon=True,
+            )
             reader_thread.start()
 
             # FIXME this seems like it could drop events, make sure to drain
@@ -330,7 +386,7 @@ class ReplicationWorker(multiprocessing.Process):
 
             stream.close()
             # FIXME this blocks :(
-            #reader_thread.join()
+            # reader_thread.join()
             log.info("replication stream closed")
 
     def handle_write_event(self, conn: Connection, table: Table, event: WriteRowsEvent):
@@ -338,13 +394,19 @@ class ReplicationWorker(multiprocessing.Process):
         query = insert(table).values(values)
         conn.execute(query)
 
-    def handle_update_event(self, conn: Connection, table: Table, event: UpdateRowsEvent):
+    def handle_update_event(
+        self, conn: Connection, table: Table, event: UpdateRowsEvent
+    ):
         event.dump()
 
-    def handle_delete_event(self, conn: Connection, table: Table, event: DeleteRowsEvent):
-
+    def handle_delete_event(
+        self, conn: Connection, table: Table, event: DeleteRowsEvent
+    ):
         def make_value(row):
-            return {column.name: row["values"][column.name] for column in table.primary_key.columns}
+            return {
+                column.name: row["values"][column.name]
+                for column in table.primary_key.columns
+            }
 
         values = [make_value(row) for row in event.rows]
         query = delete(table).where(tuple_(*table.primary_key.columns).in_(values))
@@ -352,7 +414,6 @@ class ReplicationWorker(multiprocessing.Process):
 
 
 class ReplicationMonitor(Monitor):
-
     def __init__(self, config: DBConfig):
         self.event = multiprocessing.Event()
         self.worker = ReplicationWorker(config, self.event)

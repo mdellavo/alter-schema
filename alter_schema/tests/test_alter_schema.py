@@ -1,14 +1,17 @@
 import datetime
+from operator import itemgetter
+from queue import Queue
 import random
+import threading
+import time
 from unittest import mock
 import uuid
-import time
 
-import pytest
 import pymysql
+import pytest
 
-from alter_schema.db import DBConfig
 from alter_schema.command import Command
+from alter_schema.db import DBConfig
 
 from sqlalchemy import (
     Table,
@@ -20,23 +23,28 @@ from sqlalchemy import (
     insert,
     select,
     create_engine,
-    inspect
+    inspect,
 )
 
 
 pytest_plugins = ["docker_compose"]
 
+
 class Config(DBConfig):
     @property
     def run_args(self):
         return [
-            "-H", self.host,
-            "-u", self.user,
-            "-p", self.password,
-            "-d", self.database,
-            "-t", self.table,
+            "-H",
+            self.host,
+            "-u",
+            self.user,
+            "-p",
+            self.password,
+            "-d",
+            self.database,
+            "-t",
+            self.table,
         ]
-
 
 
 @pytest.fixture(scope="function")
@@ -45,10 +53,10 @@ def test_db(request, module_scoped_container_getter):
     while True:
         try:
             connection = pymysql.connect(
-                host='localhost',
-                user='test',
-                password='test',
-                database='test',
+                host="localhost",
+                user="test",
+                password="test",
+                database="test",
             )
             connection.close()
             break
@@ -72,8 +80,7 @@ def test_db(request, module_scoped_container_getter):
 def test_no_such_table(test_db):
 
     metadata = MetaData()
-    table = Table(test_db.table, metadata,
-                  Column("id", Integer, primary_key=True))
+    table = Table(test_db.table, metadata, Column("id", Integer, primary_key=True))
 
     engine = create_engine(test_db.uri)
     with engine.connect() as conn:
@@ -87,26 +94,31 @@ def test_no_such_table(test_db):
 @mock.patch("alter_schema.command.confirm")
 def test_e2e(mock_confirm, test_db):
 
-    NUM_ROWS = 100_000
+    NUM_ROWS = 100
 
     metadata = MetaData()
-    table = Table(test_db.table, metadata,
-                  Column("id", Integer, primary_key=True),
-                  Column("num", Integer),
-                  Column("data", String(100)),
-                  Column("timestamp", DateTime))
+    table = Table(
+        test_db.table,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("num", Integer),
+        Column("data", String(100)),
+        Column("timestamp", DateTime),
+    )
 
-    copy_table = Table(test_db.copy_table, metadata,
-                       Column("id", Integer, primary_key=True))
+    copy_table = Table(
+        test_db.copy_table, metadata, Column("id", Integer, primary_key=True)
+    )
 
-    old_table = Table(test_db.old_table, metadata,
-                      Column("id", Integer, primary_key=True))
+    old_table = Table(
+        test_db.old_table, metadata, Column("id", Integer, primary_key=True)
+    )
 
     def build_row():
         return {
             "num": random.randint(0, 1_000_000),
             "data": uuid.uuid4().hex,
-            "timestamp": datetime.datetime.fromtimestamp(random.randrange(0, 2**32))
+            "timestamp": datetime.datetime.fromtimestamp(random.randrange(0, 2**32)),
         }
 
     values = [build_row() for _ in range(NUM_ROWS)]
@@ -126,14 +138,51 @@ def test_e2e(mock_confirm, test_db):
         before_rows = [row._mapping for row in conn.execute(select(table))]
         assert len(before_rows) == NUM_ROWS
 
+    event = threading.Event()
+    update_queue = Queue()
+
+    def updater():
+        with create_engine(test_db.uri).connect() as conn:
+            table = Table(test_db.table, MetaData(), autoload_with=conn)
+
+            while not event.is_set():
+                values = build_row()
+                result = conn.execute(insert(table), values)
+
+                for pk_col, pk_val in zip(
+                    table.primary_key, result.inserted_primary_key
+                ):
+                    values[pk_col.name] = pk_val
+
+                update_queue.put(values)
+                time.sleep(0.01)
+
+    updater_thread = threading.Thread(target=updater)
+    updater_thread.start()
+
     rv = Command().run(test_db.run_args)
+
+    event.set()
+    updater_thread.join()
+
     assert rv == 0
     assert mock_confirm.called
 
+    update_rows = []
+    while not update_queue.empty():
+        row = update_queue.get()
+        update_rows.append(row)
+
     with engine.connect() as conn:
         after_rows = [row._mapping for row in conn.execute(select(table))]
-        assert len(after_rows) == len(before_rows)
-        assert after_rows == before_rows
+
+        after_ids = {row["id"] for row in after_rows}
+        before_ids = {row["id"] for row in before_rows}
+        update_ids = {row["id"] for row in update_rows}
+
+        print("diff", after_ids - before_ids)
+        print("update", update_ids)
+        assert False
 
         inspector = inspect(conn)
         assert inspector.has_table(table.name)

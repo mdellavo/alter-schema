@@ -39,12 +39,10 @@ class Command:
         logging.basicConfig(level=logging.DEBUG)
 
     def parse_args(self, args):
-        parser = argparse.ArgumentParser(
-            prog="alter-schema"
-        )
+        parser = argparse.ArgumentParser(prog="alter-schema")
         parser.add_argument("-H", "--host", required=True)
         parser.add_argument("-u", "--user", default="root")
-        parser.add_argument("-p", "--password", default=None,  nargs='?')
+        parser.add_argument("-p", "--password", default=None, nargs="?")
         parser.add_argument("-P", "--port", default=3306)
         parser.add_argument("-d", "--database", required=True)
         parser.add_argument("-t", "--table", required=True)
@@ -64,7 +62,9 @@ class Command:
 
         request_queue = Queue()
         completion_queue = Queue()
-        workers = [CopyWorker(config, request_queue, completion_queue) for _ in range(WORKERS)]
+        workers = [
+            CopyWorker(config, request_queue, completion_queue) for _ in range(WORKERS)
+        ]
         for worker in workers:
             worker.start()
 
@@ -78,14 +78,14 @@ class Command:
 
             log.info("primary key %s", table.primary_key)
 
-            monitor = ReplicationMonitor(config)
-            monitor.attach()
-
             copy_table = clone_table(metadata, table, config.copy_table)
             copy_table.drop(conn, checkfirst=True)
             copy_table.create(conn, checkfirst=True)
 
             log.info("Created copy table %s", config.copy_table)
+
+            monitor = ReplicationMonitor(config)
+            monitor.attach()
 
             table_iterator = TablePageIterator(conn, table)
 
@@ -124,8 +124,13 @@ class Command:
                 old_table = Table(config.old_table, metadata)
                 old_table.drop(engine, checkfirst=True)
                 swap_tables(conn, table, copy_table)
-                log.info("swapped %s to %s, %s to %s",
-                         config.table, config.old_table, config.copy_table, config.table)
+                log.info(
+                    "swapped %s to %s, %s to %s",
+                    config.table,
+                    config.old_table,
+                    config.copy_table,
+                    config.table,
+                )
                 old_table.drop(engine, checkfirst=True)
                 log.info("dropped old table %s", config.old_table)
 
