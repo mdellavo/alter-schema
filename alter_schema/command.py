@@ -34,7 +34,7 @@ def confirm(prompt):
             return line.strip().upper() == "Y"
 
 
-class Command:
+class BasicCommand:
     def __init__(self):
         logging.basicConfig(level=logging.DEBUG)
 
@@ -53,20 +53,18 @@ class Command:
 
         return args
 
+    def on_page_copied(self, page):
+        log.info("page complete: %s", page)
+
+    def on_copy_complete(self):
+        log.info("copy complete")
+
     def main(self, args):
         config = DBConfig.from_args(args)
         log.info("connecting to %s", config.uri)
 
         engine = create_engine(config.uri)
         metadata = MetaData()
-
-        request_queue = Queue()
-        completion_queue = Queue()
-        workers = [
-            CopyWorker(config, request_queue, completion_queue) for _ in range(WORKERS)
-        ]
-        for worker in workers:
-            worker.start()
 
         with engine.connect() as conn:
 
@@ -84,12 +82,20 @@ class Command:
 
             log.info("Created copy table %s", config.copy_table)
 
+            # monitor = TriggerMonitor(config, conn, table)
             monitor = ReplicationMonitor(config)
             monitor.attach()
 
-            table_iterator = TablePageIterator(conn, table)
+            request_queue = Queue()
+            completion_queue = Queue()
+            workers = [
+                CopyWorker(config, request_queue, completion_queue)
+                for _ in range(WORKERS)
+            ]
+            for worker in workers:
+                worker.start()
 
-            pbar = tqdm.tqdm(total=table_iterator.count, unit="rows")
+            table_iterator = TablePageIterator(conn, table)
 
             def on_completion():
                 running = True
@@ -99,8 +105,7 @@ class Command:
                         running = False
                         break
 
-                    pbar.update(table_iterator.batch_size)
-                    log.debug("page complete: %s", page)
+                    self.on_page_copied(page)
 
             completion_thread = threading.Thread(target=on_completion, daemon=True)
             completion_thread.start()
@@ -117,7 +122,7 @@ class Command:
             completion_queue.put(None)
             completion_thread.join()
 
-            pbar.close()
+            self.on_copy_complete()
 
             # Swap table
             if confirm("Swap table? [Y/n] "):
@@ -139,13 +144,30 @@ class Command:
         return 0
 
     def run(self, args):
-        with logging_redirect_tqdm():
-            parsed_args = self.parse_args(args)
+        parsed_args = self.parse_args(args)
 
-            try:
-                rv = self.main(parsed_args)
-            except:
-                log.exception("main raised an unhandled exception")
-                rv = 1
+        try:
+            rv = self.main(parsed_args)
+        except:
+            log.exception("main raised an unhandled exception")
+            rv = 1
 
         return rv
+
+
+class FancyCommand(BasicCommand):
+    def __init__(self):
+        super(FancyCommand, self).__init__()
+        self.pbar = tqdm.tqdm(total=table_iterator.count, unit="rows")
+
+    def on_page_copied(self, page):
+        super(FancyCommand, self).on_page_copied(page)
+        self.pbar.update(table_iterator.batch_size)
+
+    def on_copy_complete(self):
+        super(FancyCommand, self).on_copy_complete()
+        self.pbar.close()
+
+    def run(self, args):
+        with logging_redirect_tqdm():
+            super(FancyCommand, self).run(args)

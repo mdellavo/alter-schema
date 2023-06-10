@@ -1,5 +1,4 @@
 import datetime
-from operator import itemgetter
 from queue import Queue
 import random
 import threading
@@ -10,7 +9,7 @@ import uuid
 import pymysql
 import pytest
 
-from alter_schema.command import Command
+from alter_schema.command import BasicCommand
 from alter_schema.db import DBConfig
 
 from sqlalchemy import (
@@ -54,8 +53,8 @@ def test_db(request, module_scoped_container_getter):
         try:
             connection = pymysql.connect(
                 host="localhost",
-                user="test",
-                password="test",
+                user="root",
+                password="root",
                 database="test",
             )
             connection.close()
@@ -66,8 +65,8 @@ def test_db(request, module_scoped_container_getter):
     table_name = request.function.__name__
 
     config = Config(
-        user="test",
-        password="test",
+        user="root",
+        password="root",
         host="localhost",
         database="test",
         port="3306",
@@ -87,7 +86,7 @@ def test_no_such_table(test_db):
         inspector = inspect(conn)
         assert not inspector.has_table(table.name)
 
-    rv = Command().run(test_db.run_args)
+    rv = BasicCommand().run(test_db.run_args)
     assert rv == 1
 
 
@@ -133,10 +132,12 @@ def test_e2e(mock_confirm, test_db):
         assert inspector.has_table(old_table.name)
         assert inspector.has_table(copy_table.name)
 
-        conn.execute(insert(table), values)
+        result = conn.execute(insert(table), values)
+        assert result.rowcount == NUM_ROWS
 
         before_rows = [row._mapping for row in conn.execute(select(table))]
         assert len(before_rows) == NUM_ROWS
+        conn.commit()
 
     event = threading.Event()
     update_queue = Queue()
@@ -148,6 +149,7 @@ def test_e2e(mock_confirm, test_db):
             while not event.is_set():
                 values = build_row()
                 result = conn.execute(insert(table), values)
+                conn.commit()
 
                 for pk_col, pk_val in zip(
                     table.primary_key, result.inserted_primary_key
@@ -160,7 +162,7 @@ def test_e2e(mock_confirm, test_db):
     updater_thread = threading.Thread(target=updater)
     updater_thread.start()
 
-    rv = Command().run(test_db.run_args)
+    rv = BasicCommand().run(test_db.run_args)
 
     event.set()
     updater_thread.join()
@@ -182,7 +184,10 @@ def test_e2e(mock_confirm, test_db):
 
         print("diff", after_ids - before_ids)
         print("update", update_ids)
-        assert False
+
+        assert after_ids.issuperset(before_ids)
+        assert after_ids.issuperset(update_ids)
+        assert after_ids - before_ids == update_ids
 
         inspector = inspect(conn)
         assert inspector.has_table(table.name)

@@ -30,6 +30,7 @@ from pymysqlreplication.row_event import (
     UpdateRowsEvent,
     DeleteRowsEvent,
 )
+from sqlalchemy.sql.ddl import DDL
 
 
 log = logging.getLogger("db-copy")
@@ -61,10 +62,10 @@ def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
 
 
 def swap_tables(conn: Connection, table: Table, copy_table: Table, comment=None):
-    sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name}"
+    sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name};"
     if comment:
         sql += " -- " + comment
-    conn.execute(text(sql))
+    conn.execute(DDL(sql))
 
 
 def first(xs):
@@ -223,14 +224,11 @@ class CopyWorker(multiprocessing.Process):
                     else None
                 )
 
-                page_select = select(table).where(lower_clause, upper_clause)
-                page_insert = insert(copy_table).from_select(
-                    copy_table.columns, page_select
-                )
+                base_query = select(table).where(lower_clause, upper_clause)
+                query = insert(copy_table).from_select(base_query.c, base_query)
 
-                values = {col.key: table.c[col.key] for col in table.c}
-                on_duplicate_key_update = page_insert.on_duplicate_key_update(**values)
-                conn.execute(on_duplicate_key_update)
+                conn.execute(query)
+                conn.commit()
 
                 # log.info("copying page %s", page)
                 self.completion_queue.put(page)

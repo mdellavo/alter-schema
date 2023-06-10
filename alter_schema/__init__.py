@@ -1,1 +1,1 @@
-from .command import Command
+from .command import BasicCommand, FancyCommand
