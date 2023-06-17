@@ -2,3 +2,5 @@ sqlalchemy>=2.0
 pymysql
 mysql-replication
 tqdm
+retry
+toml

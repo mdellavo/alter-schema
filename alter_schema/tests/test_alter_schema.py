@@ -3,14 +3,13 @@ from queue import Queue
 import random
 import threading
 import time
-from unittest import mock
 import uuid
 
 import pymysql
 import pytest
 
 from alter_schema.command import BasicCommand
-from alter_schema.db import DBConfig
+from alter_schema.db import DBConfig, MonitorTypes
 
 from sqlalchemy import (
     Table,
@@ -43,6 +42,10 @@ class Config(DBConfig):
             self.database,
             "-t",
             self.table,
+            "-m",
+            self.monitor,
+            "-y",
+            "--keep-old-table",
         ]
 
 
@@ -71,6 +74,9 @@ def test_db(request, module_scoped_container_getter):
         database="test",
         port="3306",
         table=table_name,
+        keep_old_table=True,
+        yes=True,
+        monitor=MonitorTypes.REPLICATION.value,
     )
 
     return config
@@ -81,7 +87,7 @@ def test_no_such_table(test_db):
     metadata = MetaData()
     table = Table(test_db.table, metadata, Column("id", Integer, primary_key=True))
 
-    engine = create_engine(test_db.uri)
+    engine = create_engine(test_db.uri, isolation_level="READ COMMITTED")
     with engine.connect() as conn:
         inspector = inspect(conn)
         assert not inspector.has_table(table.name)
@@ -90,10 +96,9 @@ def test_no_such_table(test_db):
     assert rv == 1
 
 
-@mock.patch("alter_schema.command.confirm")
-def test_e2e(mock_confirm, test_db):
+def _test_e2e(test_db):
 
-    NUM_ROWS = 100
+    NUM_ROWS = 100_000
 
     metadata = MetaData()
     table = Table(
@@ -122,7 +127,7 @@ def test_e2e(mock_confirm, test_db):
 
     values = [build_row() for _ in range(NUM_ROWS)]
 
-    engine = create_engine(test_db.uri)
+    engine = create_engine(test_db.uri, isolation_level="READ COMMITTED")
     with engine.connect() as conn:
         metadata.drop_all(bind=conn)
         metadata.create_all(bind=conn)
@@ -143,12 +148,14 @@ def test_e2e(mock_confirm, test_db):
     update_queue = Queue()
 
     def updater():
-        with create_engine(test_db.uri).connect() as conn:
-            table = Table(test_db.table, MetaData(), autoload_with=conn)
-
-            while not event.is_set():
+        while not event.is_set():
+            with create_engine(
+                test_db.uri, isolation_level="READ COMMITTED"
+            ).connect() as conn:
+                table = Table(test_db.table, MetaData(), autoload_with=conn)
                 values = build_row()
                 result = conn.execute(insert(table), values)
+                assert result.rowcount == 1
                 conn.commit()
 
                 for pk_col, pk_val in zip(
@@ -157,7 +164,7 @@ def test_e2e(mock_confirm, test_db):
                     values[pk_col.name] = pk_val
 
                 update_queue.put(values)
-                time.sleep(0.01)
+            time.sleep(0.01)
 
     updater_thread = threading.Thread(target=updater)
     updater_thread.start()
@@ -168,7 +175,6 @@ def test_e2e(mock_confirm, test_db):
     updater_thread.join()
 
     assert rv == 0
-    assert mock_confirm.called
 
     update_rows = []
     while not update_queue.empty():
@@ -182,8 +188,11 @@ def test_e2e(mock_confirm, test_db):
         before_ids = {row["id"] for row in before_rows}
         update_ids = {row["id"] for row in update_rows}
 
-        print("diff", after_ids - before_ids)
-        print("update", update_ids)
+        print("len before=", len(before_ids))
+        print("len after=", len(after_ids))
+        print("len update=", len(update_ids))
+
+        print("missing", update_ids - after_ids)
 
         assert after_ids.issuperset(before_ids)
         assert after_ids.issuperset(update_ids)
@@ -191,5 +200,15 @@ def test_e2e(mock_confirm, test_db):
 
         inspector = inspect(conn)
         assert inspector.has_table(table.name)
-        assert not inspector.has_table(old_table.name)
+        assert inspector.has_table(old_table.name)
         assert not inspector.has_table(copy_table.name)
+
+
+def test_e2e_replication(test_db):
+    test_db.monitor = MonitorTypes.REPLICATION
+    _test_e2e(test_db)
+
+
+def test_e2e_trigger(test_db):
+    test_db.monitor = MonitorTypes.TRIGGER
+    _test_e2e(test_db)

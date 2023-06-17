@@ -2,6 +2,8 @@ import argparse
 
 import getpass
 import logging
+import multiprocessing
+from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Queue
 import threading
 
@@ -12,6 +14,7 @@ import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .db import (
+    MonitorTypes,
     DBConfig,
     CopyWorker,
     TablePageIterator,
@@ -23,7 +26,7 @@ from .db import (
 
 WORKERS = 3
 
-log = logging.getLogger("alter-schema")
+log = logging.getLogger()
 
 
 def confirm(prompt):
@@ -36,7 +39,10 @@ def confirm(prompt):
 
 class BasicCommand:
     def __init__(self):
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="[%(asctime)s] %(levelname)s - %(message)s",
+        )
 
     def parse_args(self, args):
         parser = argparse.ArgumentParser(prog="alter-schema")
@@ -46,6 +52,14 @@ class BasicCommand:
         parser.add_argument("-P", "--port", default=3306)
         parser.add_argument("-d", "--database", required=True)
         parser.add_argument("-t", "--table", required=True)
+        parser.add_argument("-y", "--yes", action="store_true")
+        parser.add_argument("--keep-old-table", action="store_true")
+        parser.add_argument(
+            "-m",
+            "--monitor",
+            choices=[monitor.value for monitor in MonitorTypes],
+            default=MonitorTypes.REPLICATION.value,
+        )
         args = parser.parse_args(args=args)
 
         if args.password is None:
@@ -53,8 +67,11 @@ class BasicCommand:
 
         return args
 
+    def on_table_count(self, count):
+        log.info("%d rows to copy", count)
+
     def on_page_copied(self, page):
-        log.info("page complete: %s", page)
+        log.info("page copied: %s", page)
 
     def on_copy_complete(self):
         log.info("copy complete")
@@ -63,7 +80,7 @@ class BasicCommand:
         config = DBConfig.from_args(args)
         log.info("connecting to %s", config.uri)
 
-        engine = create_engine(config.uri)
+        engine = create_engine(config.uri, isolation_level="READ COMMITTED")
         metadata = MetaData()
 
         with engine.connect() as conn:
@@ -82,9 +99,17 @@ class BasicCommand:
 
             log.info("Created copy table %s", config.copy_table)
 
-            # monitor = TriggerMonitor(config, conn, table)
-            monitor = ReplicationMonitor(config)
+            if args.monitor and MonitorTypes(args.monitor) == MonitorTypes.TRIGGER:
+                monitor = TriggerMonitor(config, conn, table)
+            else:
+                monitor = ReplicationMonitor(config)
+
+            log.info("using %s monitor", args.monitor)
+
             monitor.attach()
+
+            table_iterator = TablePageIterator(conn, table)
+            self.on_table_count(table_iterator.count)
 
             request_queue = Queue()
             completion_queue = Queue()
@@ -94,8 +119,6 @@ class BasicCommand:
             ]
             for worker in workers:
                 worker.start()
-
-            table_iterator = TablePageIterator(conn, table)
 
             def on_completion():
                 running = True
@@ -125,7 +148,7 @@ class BasicCommand:
             self.on_copy_complete()
 
             # Swap table
-            if confirm("Swap table? [Y/n] "):
+            if config.yes or confirm("Swap table? [Y/n] "):
                 old_table = Table(config.old_table, metadata)
                 old_table.drop(engine, checkfirst=True)
                 swap_tables(conn, table, copy_table)
@@ -136,8 +159,9 @@ class BasicCommand:
                     config.copy_table,
                     config.table,
                 )
-                old_table.drop(engine, checkfirst=True)
-                log.info("dropped old table %s", config.old_table)
+                if not config.keep_old_table:
+                    old_table.drop(engine, checkfirst=True)
+                    log.info("dropped old table %s", config.old_table)
 
             monitor.detach()
 
@@ -158,16 +182,22 @@ class BasicCommand:
 class FancyCommand(BasicCommand):
     def __init__(self):
         super(FancyCommand, self).__init__()
-        self.pbar = tqdm.tqdm(total=table_iterator.count, unit="rows")
+        self.pbar = None
+
+    def on_table_count(self, count):
+        super().on_table_count(count)
+        self.pbar = tqdm.tqdm(total=count, unit="rows")
 
     def on_page_copied(self, page):
         super(FancyCommand, self).on_page_copied(page)
-        self.pbar.update(table_iterator.batch_size)
+        if self.pbar:
+            self.pbar.update(page.count)
 
     def on_copy_complete(self):
         super(FancyCommand, self).on_copy_complete()
-        self.pbar.close()
+        if self.pbar:
+            self.pbar.close()
 
     def run(self, args):
-        with logging_redirect_tqdm():
-            super(FancyCommand, self).run(args)
+        with logging_redirect_tqdm(loggers=[log]):
+            return super(FancyCommand, self).run(args)

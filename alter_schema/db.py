@@ -1,12 +1,16 @@
 import abc
+import enum
 import dataclasses
 import logging
 import math
 import multiprocessing
+import multiprocessing.synchronize
 import threading
 import random
 import time
 import queue
+
+import retry
 
 from sqlalchemy import (
     create_engine,
@@ -20,11 +24,11 @@ from sqlalchemy import (
     delete,
     tuple_,
 )
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.dialects.mysql import insert
 
 from pymysqlreplication import BinLogStreamReader
-from pymysqlreplication.event import QueryEvent
 from pymysqlreplication.row_event import (
     WriteRowsEvent,
     UpdateRowsEvent,
@@ -33,7 +37,7 @@ from pymysqlreplication.row_event import (
 from sqlalchemy.sql.ddl import DDL
 
 
-log = logging.getLogger("db-copy")
+log = logging.getLogger()
 
 BATCH_SIZE = 10000
 
@@ -61,10 +65,10 @@ def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
     return copy_table
 
 
-def swap_tables(conn: Connection, table: Table, copy_table: Table, comment=None):
+@retry.retry(exceptions=(OperationalError,), tries=3, delay=2)
+def swap_tables(conn: Connection, table: Table, copy_table: Table):
     sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name};"
-    if comment:
-        sql += " -- " + comment
+    conn.execute(text("SET lock_wait_timeout=5"))
     conn.execute(DDL(sql))
 
 
@@ -78,6 +82,11 @@ def scalar(xs):
     return result[0] if result else result
 
 
+class MonitorTypes(enum.Enum):
+    TRIGGER = "trigger"
+    REPLICATION = "replication"
+
+
 @dataclasses.dataclass
 class DBConfig:
     user: str
@@ -86,6 +95,9 @@ class DBConfig:
     database: str
     port: str
     table: str
+    yes: bool = False
+    keep_old_table: bool = False
+    monitor: MonitorTypes | None = None
 
     @property
     def uri(self):
@@ -114,7 +126,16 @@ class DBConfig:
             args.database,
             args.port,
             args.table,
+            yes=args.yes,
+            keep_old_table=args.keep_old_table,
         )
+
+
+@dataclasses.dataclass
+class TablePage:
+    count: int
+    lower: tuple
+    upper: tuple
 
 
 class TablePageIterator:
@@ -164,15 +185,15 @@ class TablePageIterator:
         query = select(*cols)
         result = first(self.conn.execute(query))
 
-        lower = [getattr(result, "min_" + col.name) for col in base_query.c]
-        upper = [getattr(result, "max_" + col.name) for col in base_query.c]
+        lower = tuple(getattr(result, "min_" + col.name) for col in base_query.c)
+        upper = tuple(getattr(result, "max_" + col.name) for col in base_query.c)
 
         if result.count < self.batch_size:
             self.exhaused = True
 
         self.last_page = upper
 
-        return (lower, upper)
+        return TablePage(result.count, lower, upper)
 
 
 class CopyWorker(multiprocessing.Process):
@@ -188,7 +209,7 @@ class CopyWorker(multiprocessing.Process):
         self.completion_queue = completion_queue
 
     def run(self) -> None:
-        engine = create_engine(self.config.uri)
+        engine = create_engine(self.config.uri, isolation_level="READ COMMITTED")
         metadata = MetaData()
 
         running = True
@@ -202,35 +223,37 @@ class CopyWorker(multiprocessing.Process):
                     running = False
                     break
 
-                lower, upper = page
                 lower_clause = (
                     and_(
                         *[
                             col >= val
-                            for col, val in zip(table.primary_key.columns, lower)
+                            for col, val in zip(table.primary_key.columns, page.lower)
                         ]
                     )
-                    if lower
+                    if page.lower
                     else None
                 )
                 upper_clause = (
                     and_(
                         *[
                             col <= val
-                            for col, val in zip(table.primary_key.columns, upper)
+                            for col, val in zip(table.primary_key.columns, page.upper)
                         ]
                     )
-                    if upper
+                    if page.upper
                     else None
                 )
 
                 base_query = select(table).where(lower_clause, upper_clause)
-                query = insert(copy_table).from_select(base_query.c, base_query)
+                query = (
+                    insert(copy_table)
+                    .prefix_with("IGNORE")
+                    .from_select(base_query.c, base_query)
+                )
 
                 conn.execute(query)
                 conn.commit()
 
-                # log.info("copying page %s", page)
                 self.completion_queue.put(page)
 
 
@@ -310,7 +333,23 @@ class TriggerMonitor(Monitor):
         log.info("triggers detached")
 
 
-def replication_reader(event, stream: BinLogStreamReader, q: queue.Queue):
+def replication_reader(
+    event: multiprocessing.synchronize.Event, config: DBConfig, q: queue.Queue
+):
+
+    server_id = random.randint(0, 1_000_000)
+    stream = BinLogStreamReader(
+        connection_settings={
+            "host": config.host,
+            "port": int(config.port),
+            "user": config.user,
+            "passwd": config.password,
+        },
+        server_id=server_id,
+        blocking=True,
+        skip_to_timestamp=time.time(),
+    )
+
     while not event.is_set():
         try:
             ev = stream.fetchone()
@@ -319,78 +358,75 @@ def replication_reader(event, stream: BinLogStreamReader, q: queue.Queue):
             log.exception("error during replication reader")
             break
 
+    stream.close()
+
 
 class ReplicationWorker(multiprocessing.Process):
 
-    READ_TIMEOUT = 1
+    READ_TIMEOUT = 0.1
 
-    def __init__(self, config: DBConfig, event):
+    def __init__(self, config: DBConfig, event: multiprocessing.synchronize.Event):
         super(ReplicationWorker, self).__init__()
         self.config = config
         self.event = event
 
     def run(self):
 
-        engine = create_engine(self.config.uri)
+        engine = create_engine(self.config.uri, isolation_level="READ COMMITTED")
         metadata = MetaData()
 
+        switched = False
         with engine.connect() as conn:
             table = Table(self.config.table, metadata, autoload_with=engine)
             copy_table = Table(self.config.copy_table, metadata, autoload_with=engine)
 
-            server_id = random.randint(0, 1_000_000)
-            stream = BinLogStreamReader(
-                connection_settings={
-                    "host": self.config.host,
-                    "port": int(self.config.port),
-                    "user": self.config.user,
-                    "passwd": self.config.password,
-                },
-                server_id=server_id,
-                blocking=True,
-                only_tables=[
-                    self.config.table,
-                ],
-                only_events=[
-                    QueryEvent,
-                    UpdateRowsEvent,
-                    WriteRowsEvent,
-                    DeleteRowsEvent,
-                ],
-                skip_to_timestamp=time.time(),
-            )
+            def _target_table():
+                return table if switched else copy_table
 
             reader_queue = queue.Queue()
             reader_thread = threading.Thread(
                 target=replication_reader,
-                args=(self.event, stream, reader_queue),
-                daemon=True,
+                args=(self.event, self.config, reader_queue),
             )
             reader_thread.start()
 
-            # FIXME this seems like it could drop events, make sure to drain
-            while not self.event.is_set():
+            while True:
                 try:
                     event = reader_queue.get(timeout=self.READ_TIMEOUT)
                 except queue.Empty:
+                    if self.event.is_set():
+                        break
                     continue
 
-                if type(event) == WriteRowsEvent:
-                    self.handle_write_event(conn, copy_table, event)
-                elif type(event) == UpdateRowsEvent:
-                    self.handle_update_event(conn, copy_table, event)
-                elif type(event) == DeleteRowsEvent:
-                    self.handle_delete_event(conn, copy_table, event)
+                try:
+                    self.handle_event(conn, _target_table(), event)
+                except ProgrammingError as e:
+                    log.debug("checking for table switch")
+                    if str(e.orig.args[0]) == "1146":
+                        switched = True
+                        log.info("table switches")
+                        time.sleep(0.02)
+                        self.handle_event(conn, _target_table(), event)
 
-            stream.close()
-            # FIXME this blocks :(
-            # reader_thread.join()
+            reader_thread.join()
             log.info("replication stream closed")
 
+    def handle_event(self, conn: Connection, table: Table, event):
+        if type(event) == WriteRowsEvent:
+            self.handle_write_event(conn, table, event)
+        elif type(event) == UpdateRowsEvent:
+            self.handle_update_event(conn, table, event)
+        elif type(event) == DeleteRowsEvent:
+            self.handle_delete_event(conn, table, event)
+
     def handle_write_event(self, conn: Connection, table: Table, event: WriteRowsEvent):
+        if not event.rows:
+            return
         values = [row["values"] for row in event.rows]
-        query = insert(table).values(values)
-        conn.execute(query)
+        query = insert(table).prefix_with("IGNORE").values(values)
+        result = conn.execute(query)
+        conn.commit()
+        log.info("inserted %d rows", result.rowcount)
 
     def handle_update_event(
         self, conn: Connection, table: Table, event: UpdateRowsEvent
@@ -400,6 +436,9 @@ class ReplicationWorker(multiprocessing.Process):
     def handle_delete_event(
         self, conn: Connection, table: Table, event: DeleteRowsEvent
     ):
+        if not event.rows:
+            return
+
         def make_value(row):
             return {
                 column.name: row["values"][column.name]
@@ -408,7 +447,9 @@ class ReplicationWorker(multiprocessing.Process):
 
         values = [make_value(row) for row in event.rows]
         query = delete(table).where(tuple_(*table.primary_key.columns).in_(values))
-        conn.execute(query)
+        result = conn.execute(query)
+        conn.commit()
+        log.info("deleted %d rows", result.rowcount)
 
 
 class ReplicationMonitor(Monitor):
@@ -421,6 +462,7 @@ class ReplicationMonitor(Monitor):
         log.info("replication attached")
 
     def detach(self):
+        log.info("waiting for replication to detach...")
         self.event.set()
         self.worker.join()
         log.info("replication detached")
