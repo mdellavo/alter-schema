@@ -1,3 +1,4 @@
 pytest
 pytest-docker-compose
 pre-commit
+ipython

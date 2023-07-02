@@ -1,1 +1,9 @@
-[database]
+[alter]
+host = "db.example.com"
+user = "user"
+port = 3306
+table="test"
+changes = [
+    "ADD COLUMN foo",
+    "ADD INDEX foo",
+]

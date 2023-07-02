@@ -31,7 +31,7 @@ pytest_plugins = ["docker_compose"]
 class Config(DBConfig):
     @property
     def run_args(self):
-        return [
+        rv = [
             "-H",
             self.host,
             "-u",
@@ -47,6 +47,16 @@ class Config(DBConfig):
             "-y",
             "--keep-old-table",
         ]
+
+        for alter in self.alter:
+            rv.extend(
+                [
+                    "-a",
+                    alter,
+                ]
+            )
+
+        return rv
 
 
 @pytest.fixture(scope="function")
@@ -76,6 +86,11 @@ def test_db(request, module_scoped_container_getter):
         table=table_name,
         keep_old_table=True,
         yes=True,
+        alter=[
+            "ADD COLUMN foo INT",
+            "ADD COLUMN bar VARCHAR(100)",
+            "ADD COLUMN baz DATETIME",
+        ],
         monitor=MonitorTypes.REPLICATION.value,
     )
 
@@ -203,12 +218,19 @@ def _test_e2e(test_db):
         assert inspector.has_table(old_table.name)
         assert not inspector.has_table(copy_table.name)
 
+        columns = inspector.get_columns(table.name)
+        print(columns)
+        col_map = {column["name"]: column for column in columns}
+        new_cols = ("foo", "bar", "baz")
+        for col_name in new_cols:
+            assert col_name in col_map
+
 
 def test_e2e_replication(test_db):
-    test_db.monitor = MonitorTypes.REPLICATION
+    test_db.monitor = MonitorTypes.REPLICATION.value
     _test_e2e(test_db)
 
 
 def test_e2e_trigger(test_db):
-    test_db.monitor = MonitorTypes.TRIGGER
+    test_db.monitor = MonitorTypes.TRIGGER.value
     _test_e2e(test_db)

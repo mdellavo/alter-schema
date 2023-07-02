@@ -9,6 +9,7 @@ import threading
 import random
 import time
 import queue
+from typing import Optional
 
 import retry
 
@@ -95,9 +96,10 @@ class DBConfig:
     database: str
     port: str
     table: str
+    alter: list[str] = dataclasses.field(default_factory=list)
     yes: bool = False
     keep_old_table: bool = False
-    monitor: MonitorTypes | None = None
+    monitor: Optional[MonitorTypes] = None
 
     @property
     def uri(self):
@@ -126,6 +128,7 @@ class DBConfig:
             args.database,
             args.port,
             args.table,
+            alter=args.alter,
             yes=args.yes,
             keep_old_table=args.keep_old_table,
         )
@@ -273,7 +276,7 @@ class TriggerMonitor(Monitor):
     CREATE TRIGGER schema_alter_monitor_insert AFTER INSERT ON {table_name}
       FOR EACH ROW
       BEGIN
-        REPLACE INTO {table_name} ({cols}) VALUES ({new_values});
+        REPLACE INTO {copy_table_name} ({cols}) VALUES ({new_values});
       END
     """
 
@@ -281,14 +284,14 @@ class TriggerMonitor(Monitor):
     CREATE TRIGGER schema_alter_monitor_update AFTER UPDATE ON {table_name}
       FOR EACH ROW
       BEGIN
-        REPLACE INTO {table_name} ({cols}) VALUES ({new_values});
+        REPLACE INTO {copy_table_name} ({cols}) VALUES ({new_values});
       END
     """
 
     DELETE_TRIGGER_SQL = """
     CREATE TRIGGER schema_alter_monitor_delete AFTER DELETE ON {table_name}
       FOR EACH ROW
-        DELETE FROM {table_name} WHERE {pk_where}
+        DELETE FROM {copy_table_name} WHERE {pk_where}
     """
 
     TRIGGER_NAMES = [
@@ -311,7 +314,8 @@ class TriggerMonitor(Monitor):
         ]
 
         return template.format(
-            table_name=self.table.name,
+            table_name=self.config.table,
+            copy_table_name=self.config.copy_table,
             cols=", ".join(cols),
             new_values=", ".join(new_values),
             pk_where=" AND ".join(pk_where),

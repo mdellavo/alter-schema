@@ -7,7 +7,7 @@ from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Queue
 import threading
 
-from sqlalchemy import create_engine, MetaData, Table
+from sqlalchemy import create_engine, MetaData, Table, DDL
 from sqlalchemy.exc import NoSuchTableError
 
 import tqdm
@@ -26,7 +26,7 @@ from .db import (
 
 WORKERS = 3
 
-log = logging.getLogger()
+log = logging.getLogger("alter-schema")
 
 
 def confirm(prompt):
@@ -53,6 +53,7 @@ class BasicCommand:
         parser.add_argument("-d", "--database", required=True)
         parser.add_argument("-t", "--table", required=True)
         parser.add_argument("-y", "--yes", action="store_true")
+        parser.add_argument("-a", "--alter", action="append", default=[])
         parser.add_argument("--keep-old-table", action="store_true")
         parser.add_argument(
             "-m",
@@ -147,6 +148,11 @@ class BasicCommand:
 
             self.on_copy_complete()
 
+            for alter in config.alter:
+                sql = f"ALTER TABLE {config.copy_table} " + alter
+                log.info("APPLYING: %s", sql)
+                conn.execute(DDL(sql))
+
             # Swap table
             if config.yes or confirm("Swap table? [Y/n] "):
                 old_table = Table(config.old_table, metadata)
@@ -190,6 +196,7 @@ class FancyCommand(BasicCommand):
 
     def on_page_copied(self, page):
         super(FancyCommand, self).on_page_copied(page)
+
         if self.pbar:
             self.pbar.update(page.count)
 
@@ -199,5 +206,5 @@ class FancyCommand(BasicCommand):
             self.pbar.close()
 
     def run(self, args):
-        with logging_redirect_tqdm(loggers=[log]):
+        with logging_redirect_tqdm():
             return super(FancyCommand, self).run(args)
