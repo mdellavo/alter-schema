@@ -1,42 +1,24 @@
 import abc
-import enum
 import dataclasses
+import enum
 import logging
 import math
 import multiprocessing
 import multiprocessing.synchronize
-import threading
-import random
-import time
 import queue
+import random
+import threading
+import time
 from typing import Optional
 
 import retry
-
-from sqlalchemy import (
-    create_engine,
-    MetaData,
-    Table,
-    Column,
-    select,
-    and_,
-    func,
-    text,
-    delete,
-    tuple_,
-)
-from sqlalchemy.exc import OperationalError, ProgrammingError
-from sqlalchemy.engine.base import Connection
-from sqlalchemy.dialects.mysql import insert
-
 from pymysqlreplication import BinLogStreamReader
-from pymysqlreplication.row_event import (
-    WriteRowsEvent,
-    UpdateRowsEvent,
-    DeleteRowsEvent,
-)
+from pymysqlreplication.row_event import DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent
+from sqlalchemy import Column, MetaData, Table, and_, create_engine, delete, func, select, text, tuple_
+from sqlalchemy.dialects.mysql import insert
+from sqlalchemy.engine.base import Connection
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.sql.ddl import DDL
-
 
 log = logging.getLogger()
 
@@ -68,7 +50,7 @@ def clone_table(metadata: MetaData, table: Table, copy_table_name: str):
 
 @retry.retry(exceptions=(OperationalError,), tries=3, delay=2)
 def swap_tables(conn: Connection, table: Table, copy_table: Table):
-    sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name};"
+    sql = f"RENAME TABLE {table.name} TO {table.name}_old, {copy_table.name} TO {table.name};"  # noqa
     conn.execute(text("SET lock_wait_timeout=5"))
     conn.execute(DDL(sql))
 
@@ -103,9 +85,7 @@ class DBConfig:
 
     @property
     def uri(self):
-        return (
-            f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
-        )
+        return f"mysql+pymysql://{self.user}:{self.password}@{self.host}/{self.database}"
 
     @property
     def as_dict(self):
@@ -168,11 +148,7 @@ class TablePageIterator:
 
         pk_cols = self.table.primary_key.columns
 
-        base_query = (
-            select(pk_cols)
-            .order_by(*[col.asc() for col in pk_cols.values()])
-            .limit(self.batch_size)
-        )
+        base_query = select(pk_cols).order_by(*[col.asc() for col in pk_cols.values()]).limit(self.batch_size)
         if self.last_page:
             clauses = [col >= val for col, val in zip(pk_cols, self.last_page)]
             base_query = base_query.where(and_(*clauses))
@@ -227,32 +203,18 @@ class CopyWorker(multiprocessing.Process):
                     break
 
                 lower_clause = (
-                    and_(
-                        *[
-                            col >= val
-                            for col, val in zip(table.primary_key.columns, page.lower)
-                        ]
-                    )
+                    and_(*[col >= val for col, val in zip(table.primary_key.columns, page.lower)])
                     if page.lower
                     else None
                 )
                 upper_clause = (
-                    and_(
-                        *[
-                            col <= val
-                            for col, val in zip(table.primary_key.columns, page.upper)
-                        ]
-                    )
+                    and_(*[col <= val for col, val in zip(table.primary_key.columns, page.upper)])
                     if page.upper
                     else None
                 )
 
                 base_query = select(table).where(lower_clause, upper_clause)
-                query = (
-                    insert(copy_table)
-                    .prefix_with("IGNORE")
-                    .from_select(base_query.c, base_query)
-                )
+                query = insert(copy_table).prefix_with("IGNORE").from_select(base_query.c, base_query)
 
                 conn.execute(query)
                 conn.commit()
@@ -308,10 +270,7 @@ class TriggerMonitor(Monitor):
     def _build(self, template: str):
         cols = [col.name for col in self.table.c.values()]
         new_values = ["NEW." + col.name for col in self.table.c.values()]
-        pk_where = [
-            col.name + " = OLD." + col.name
-            for col in self.table.primary_key.columns.values()
-        ]
+        pk_where = [col.name + " = OLD." + col.name for col in self.table.primary_key.columns.values()]
 
         return template.format(
             table_name=self.config.table,
@@ -337,9 +296,7 @@ class TriggerMonitor(Monitor):
         log.info("triggers detached")
 
 
-def replication_reader(
-    event: multiprocessing.synchronize.Event, config: DBConfig, q: queue.Queue
-):
+def replication_reader(event: multiprocessing.synchronize.Event, config: DBConfig, q: queue.Queue):
 
     server_id = random.randint(0, 1_000_000)
     stream = BinLogStreamReader(
@@ -432,22 +389,15 @@ class ReplicationWorker(multiprocessing.Process):
         conn.commit()
         log.info("inserted %d rows", result.rowcount)
 
-    def handle_update_event(
-        self, conn: Connection, table: Table, event: UpdateRowsEvent
-    ):
+    def handle_update_event(self, conn: Connection, table: Table, event: UpdateRowsEvent):
         event.dump()
 
-    def handle_delete_event(
-        self, conn: Connection, table: Table, event: DeleteRowsEvent
-    ):
+    def handle_delete_event(self, conn: Connection, table: Table, event: DeleteRowsEvent):
         if not event.rows:
             return
 
         def make_value(row):
-            return {
-                column.name: row["values"][column.name]
-                for column in table.primary_key.columns
-            }
+            return {column.name: row["values"][column.name] for column in table.primary_key.columns}
 
         values = [make_value(row) for row in event.rows]
         query = delete(table).where(tuple_(*table.primary_key.columns).in_(values))

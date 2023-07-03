@@ -2,9 +2,10 @@
 
 import sys
 
-from alter_schema import BasicCommand, FancyCommand
+from alter_schema import get_command, parse_args
 
 if __name__ == "__main__":
-    command = FancyCommand()
-    rv = command.run(sys.argv[1:])
+    args = parse_args(sys.argv[1:])
+    command = get_command(args)
+    rv = command.run(args)
     sys.exit(rv)

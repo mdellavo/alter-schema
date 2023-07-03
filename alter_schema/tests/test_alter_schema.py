@@ -1,29 +1,16 @@
 import datetime
-from queue import Queue
 import random
 import threading
 import time
 import uuid
+from queue import Queue
 
 import pymysql
 import pytest
+from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, create_engine, insert, inspect, select
 
-from alter_schema.command import BasicCommand
+from alter_schema import get_command, parse_args
 from alter_schema.db import DBConfig, MonitorTypes
-
-from sqlalchemy import (
-    Table,
-    MetaData,
-    Column,
-    Integer,
-    String,
-    DateTime,
-    insert,
-    select,
-    create_engine,
-    inspect,
-)
-
 
 pytest_plugins = ["docker_compose"]
 
@@ -46,6 +33,7 @@ class Config(DBConfig):
             self.monitor,
             "-y",
             "--keep-old-table",
+            "--no-progress",
         ]
 
         for alter in self.alter:
@@ -107,7 +95,9 @@ def test_no_such_table(test_db):
         inspector = inspect(conn)
         assert not inspector.has_table(table.name)
 
-    rv = BasicCommand().run(test_db.run_args)
+    args = parse_args(test_db.run_args)
+    command = get_command(args)
+    rv = command.run(test_db)
     assert rv == 1
 
 
@@ -125,13 +115,9 @@ def _test_e2e(test_db):
         Column("timestamp", DateTime),
     )
 
-    copy_table = Table(
-        test_db.copy_table, metadata, Column("id", Integer, primary_key=True)
-    )
+    copy_table = Table(test_db.copy_table, metadata, Column("id", Integer, primary_key=True))
 
-    old_table = Table(
-        test_db.old_table, metadata, Column("id", Integer, primary_key=True)
-    )
+    old_table = Table(test_db.old_table, metadata, Column("id", Integer, primary_key=True))
 
     def build_row():
         return {
@@ -164,18 +150,14 @@ def _test_e2e(test_db):
 
     def updater():
         while not event.is_set():
-            with create_engine(
-                test_db.uri, isolation_level="READ COMMITTED"
-            ).connect() as conn:
+            with create_engine(test_db.uri, isolation_level="READ COMMITTED").connect() as conn:
                 table = Table(test_db.table, MetaData(), autoload_with=conn)
                 values = build_row()
                 result = conn.execute(insert(table), values)
                 assert result.rowcount == 1
                 conn.commit()
 
-                for pk_col, pk_val in zip(
-                    table.primary_key, result.inserted_primary_key
-                ):
+                for pk_col, pk_val in zip(table.primary_key, result.inserted_primary_key):
                     values[pk_col.name] = pk_val
 
                 update_queue.put(values)
@@ -184,7 +166,9 @@ def _test_e2e(test_db):
     updater_thread = threading.Thread(target=updater)
     updater_thread.start()
 
-    rv = BasicCommand().run(test_db.run_args)
+    args = parse_args(test_db.run_args)
+    command = get_command(args)
+    rv = command.run(args)
 
     event.set()
     updater_thread.join()

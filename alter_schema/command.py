@@ -1,25 +1,24 @@
+import abc
 import argparse
-
 import getpass
 import logging
-import multiprocessing
-from logging.handlers import QueueHandler, QueueListener
-from multiprocessing import Queue
 import threading
-
-from sqlalchemy import create_engine, MetaData, Table, DDL
-from sqlalchemy.exc import NoSuchTableError
+from argparse import Namespace
+from multiprocessing import Queue
+from typing import Optional
 
 import tqdm
+from sqlalchemy import DDL, MetaData, Table, create_engine
+from sqlalchemy.exc import NoSuchTableError
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .db import (
-    MonitorTypes,
-    DBConfig,
     CopyWorker,
+    DBConfig,
+    MonitorTypes,
+    ReplicationMonitor,
     TablePageIterator,
     TriggerMonitor,
-    ReplicationMonitor,
     clone_table,
     swap_tables,
 )
@@ -29,7 +28,7 @@ WORKERS = 3
 log = logging.getLogger("alter-schema")
 
 
-def confirm(prompt):
+def confirm(prompt: str):
     line = None
     while not line:
         line = input(prompt) or "Y"
@@ -37,36 +36,53 @@ def confirm(prompt):
             return line.strip().upper() == "Y"
 
 
-class BasicCommand:
+class Args(Namespace):
+    host: str
+    user: str
+    password: Optional[str]
+    port: int
+    database: str
+    table: str
+    yes: bool
+    alter: list[str]
+    yes: bool
+    keep_old_table: bool
+    monitor: Optional[MonitorTypes]
+    progress: bool
+
+
+COMMANDS = {}
+
+
+class Command(metaclass=abc.ABCMeta):
+    NAME: str
+
+    def __init_subclass__(cls, **kwargs):
+        COMMANDS[cls.NAME] = cls
+
+    def run(self, args: Args) -> int:
+        # noinspection PyBroadException
+        try:
+            rv = self.main(args)
+        except Exception:
+            log.exception("main raised an unhandled exception")
+            rv = 1
+
+        return rv
+
+    @abc.abstractmethod
+    def main(self, args: Args) -> int:
+        pass
+
+
+class BasicCommand(Command):
+    NAME = "basic"
+
     def __init__(self):
         logging.basicConfig(
             level=logging.DEBUG,
             format="[%(asctime)s] %(levelname)s - %(message)s",
         )
-
-    def parse_args(self, args):
-        parser = argparse.ArgumentParser(prog="alter-schema")
-        parser.add_argument("-H", "--host", required=True)
-        parser.add_argument("-u", "--user", default="root")
-        parser.add_argument("-p", "--password", default=None, nargs="?")
-        parser.add_argument("-P", "--port", default=3306)
-        parser.add_argument("-d", "--database", required=True)
-        parser.add_argument("-t", "--table", required=True)
-        parser.add_argument("-y", "--yes", action="store_true")
-        parser.add_argument("-a", "--alter", action="append", default=[])
-        parser.add_argument("--keep-old-table", action="store_true")
-        parser.add_argument(
-            "-m",
-            "--monitor",
-            choices=[monitor.value for monitor in MonitorTypes],
-            default=MonitorTypes.REPLICATION.value,
-        )
-        args = parser.parse_args(args=args)
-
-        if args.password is None:
-            args.password = getpass.getpass()
-
-        return args
 
     def on_table_count(self, count):
         log.info("%d rows to copy", count)
@@ -77,7 +93,7 @@ class BasicCommand:
     def on_copy_complete(self):
         log.info("copy complete")
 
-    def main(self, args):
+    def main(self, args: Args):
         config = DBConfig.from_args(args)
         log.info("connecting to %s", config.uri)
 
@@ -100,7 +116,11 @@ class BasicCommand:
 
             log.info("Created copy table %s", config.copy_table)
 
-            if args.monitor and MonitorTypes(args.monitor) == MonitorTypes.TRIGGER:
+            if args.monitor:
+                monitor_type = MonitorTypes(args.monitor)
+            else:
+                monitor_type = MonitorTypes.REPLICATION
+            if monitor_type == MonitorTypes.TRIGGER:
                 monitor = TriggerMonitor(config, conn, table)
             else:
                 monitor = ReplicationMonitor(config)
@@ -114,19 +134,14 @@ class BasicCommand:
 
             request_queue = Queue()
             completion_queue = Queue()
-            workers = [
-                CopyWorker(config, request_queue, completion_queue)
-                for _ in range(WORKERS)
-            ]
+            workers = [CopyWorker(config, request_queue, completion_queue) for _ in range(WORKERS)]
             for worker in workers:
                 worker.start()
 
             def on_completion():
-                running = True
-                while running:
+                while True:
                     page = completion_queue.get()
                     if not page:
-                        running = False
                         break
 
                     self.on_page_copied(page)
@@ -173,19 +188,10 @@ class BasicCommand:
 
         return 0
 
-    def run(self, args):
-        parsed_args = self.parse_args(args)
-
-        try:
-            rv = self.main(parsed_args)
-        except:
-            log.exception("main raised an unhandled exception")
-            rv = 1
-
-        return rv
-
 
 class FancyCommand(BasicCommand):
+    NAME = "fancy"
+
     def __init__(self):
         super(FancyCommand, self).__init__()
         self.pbar = None
@@ -208,3 +214,36 @@ class FancyCommand(BasicCommand):
     def run(self, args):
         with logging_redirect_tqdm():
             return super(FancyCommand, self).run(args)
+
+
+def parse_args(args: list[str]) -> Args:
+    parser = argparse.ArgumentParser(prog="alter-schema")
+    parser.add_argument("-H", "--host", required=True)
+    parser.add_argument("-u", "--user", default="root")
+    parser.add_argument("-p", "--password", default=None, nargs="?")
+    parser.add_argument("-P", "--port", default=3306)
+    parser.add_argument("-d", "--database", required=True)
+    parser.add_argument("-t", "--table", required=True)
+    parser.add_argument("-y", "--yes", action="store_true")
+    parser.add_argument("-a", "--alter", action="append", default=[])
+    parser.add_argument("--keep-old-table", action="store_true")
+    parser.add_argument("--progress", action="store_true", dest="progress", default=True)
+    parser.add_argument("--no-progress", action="store_false", dest="progress")
+    parser.add_argument(
+        "-m",
+        "--monitor",
+        choices=[monitor.value for monitor in MonitorTypes],
+        default=MonitorTypes.REPLICATION.value,
+    )
+    args = parser.parse_args(args=args)
+
+    if args.password is None:
+        args.password = getpass.getpass()
+
+    return args
+
+
+def get_command(args: Args) -> Command:
+    if args.progress:
+        return FancyCommand()
+    return BasicCommand()
